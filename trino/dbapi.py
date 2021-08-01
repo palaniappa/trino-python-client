@@ -25,6 +25,8 @@ import uuid
 import datetime
 import math
 
+import pandas as pd
+
 from trino import constants
 import trino.exceptions
 import trino.client
@@ -76,7 +78,7 @@ class Connection(object):
         max_attempts=constants.DEFAULT_MAX_ATTEMPTS,
         request_timeout=constants.DEFAULT_REQUEST_TIMEOUT,
         isolation_level=IsolationLevel.AUTOCOMMIT,
-        verify=True
+        verify=True,
     ):
         self.host = host
         self.port = port
@@ -380,6 +382,7 @@ class Cursor(object):
                 self._query = self._get_added_prepare_statement_trino_query(
                     statement_name, params
                 )
+
                 result = self._query.execute(
                     additional_http_headers={
                         constants.HEADER_PREPARED_STATEMENT: added_prepare_header
@@ -392,8 +395,8 @@ class Cursor(object):
                 self._deallocate_prepare_statement(added_prepare_header, statement_name)
 
         else:
-            self._query = trino.client.TrinoQuery(self._request, sql=operation)
-            result = self._query.execute()
+            self._query = trino.client.TrinoQuery(self._request, sql=operation,use_arrow=False)
+            result = self._query.execute(additional_http_headers=None)
         self._iterator = iter(result)
         return result
 
@@ -456,6 +459,9 @@ class Cursor(object):
     def fetchall(self) -> List[List[Any]]:
         return list(self.genall())
 
+    def get_metadata(self):
+        return self._query.columns
+
     def cancel(self):
         if self._query is None:
             raise trino.exceptions.OperationalError(
@@ -465,6 +471,11 @@ class Cursor(object):
 
     def close(self):
         self._connection.close()
+
+    def to_pandas(self, operation) -> pd.DataFrame:
+        self._query = trino.client.TrinoQuery(self._request, sql=operation,use_arrow=True)
+        result = self._query.to_pandas()
+        return result
 
 
 Date = datetime.date
