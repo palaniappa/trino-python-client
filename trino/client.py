@@ -32,12 +32,15 @@ The main interface is :class:`TrinoQuery`: ::
     >> query =  TrinoQuery(request, sql)
     >> rows = list(query.execute())
 """
-
+import time
 import copy
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
+import pandas as pd
+import base64
+import pyarrow as pa
 
 import trino.logging
 from trino import constants, exceptions
@@ -95,7 +98,7 @@ def get_session_property_values(headers, header):
 
 
 class TrinoStatus(object):
-    def __init__(self, id, stats, warnings, info_uri, next_uri, rows, columns=None):
+    def __init__(self, id, stats, warnings, info_uri, next_uri, rows, columns=None, arrow_stream=None):
         self.id = id
         self.stats = stats
         self.warnings = warnings
@@ -103,6 +106,7 @@ class TrinoStatus(object):
         self.next_uri = next_uri
         self.rows = rows
         self.columns = columns
+        self.arrow_stream = arrow_stream
 
     def __repr__(self):
         return (
@@ -402,7 +406,7 @@ class TrinoRequest(object):
                 self._client_session.properties[key] = value
 
         self._next_uri = response.get("nextUri")
-
+    
         return TrinoStatus(
             id=response["id"],
             stats=response["stats"],
@@ -411,6 +415,7 @@ class TrinoRequest(object):
             next_uri=self._next_uri,
             rows=response.get("data", []),
             columns=response.get("columns"),
+            arrow_stream=response.get("arrowStream")
         )
 
 
@@ -458,6 +463,7 @@ class TrinoQuery(object):
         self,
         request: TrinoRequest,
         sql: str,
+        use_arrow,
     ) -> None:
         self.query_id: Optional[str] = None
 
@@ -470,6 +476,7 @@ class TrinoQuery(object):
         self._sql = sql
         self._result = TrinoResult(self)
         self._response_headers = None
+        self._use_arrow=use_arrow
 
     @property
     def columns(self):
@@ -491,6 +498,65 @@ class TrinoQuery(object):
     @property
     def result(self):
         return self._result
+
+    @property
+    def use_arrow(self):
+        return self._use_arrow
+
+    def to_pandas(self) -> pd.DataFrame:
+        startTime1 = time.time()
+        if self.cancelled:
+            raise exceptions.TrinoUserError("Query has been cancelled", self.query_id)
+
+        response = self._request.post(self._sql, None)
+        status = self._request.process(response)
+        self.query_id = status.id
+        self._stats.update({"queryId": self.query_id})
+        self._stats.update(status.stats)
+        self._warnings = getattr(status, "warnings", [])
+        if status.next_uri is None:
+            self._finished = True
+        tables = []
+        if status.arrow_stream is not None:
+            table = self.convert_stream_to_dataframe(status.arrow_stream)
+            tables.append(table)
+        
+        while self._finished == False:
+            response = self._request.get(self._request.next_uri+"?resultFormat=ARROW")
+            status = self._request.process(response)
+            if status.columns:
+                self._columns = status.columns
+            self._stats.update(status.stats)
+            logger.debug(status)
+            self._response_headers = response.headers
+            if status.next_uri is None:
+                self._finished = True
+            if status.arrow_stream is not None:
+                table = self.convert_stream_to_dataframe(status.arrow_stream)
+                tables.append(table)
+                
+        startTime = time.time()
+        combined_table = pa.concat_tables(tables)
+        result = pa.Table.to_pandas(combined_table)
+        endTime = time.time()
+        elapsed = endTime - startTime
+        print ('Time taken to concatenate df',elapsed)
+        elapsed = endTime - startTime1
+        print ('Time taken to_pandas',elapsed)
+        return result
+        
+
+    def convert_stream_to_dataframe(self, arrow_stream)->pa.Table:
+        startTime = time.time()
+        streamString = base64.b64decode(arrow_stream)
+        streamBytes = bytes(streamString)
+        reader = pa.RecordBatchStreamReader(streamBytes)
+        table = reader.read_all()
+        endTime = time.time()
+        elapsed = endTime - startTime
+        #print ('Time taken to create 1 df',elapsed)
+        return table
+
 
     def execute(self, additional_http_headers=None) -> TrinoResult:
         """Initiate a Trino query by sending the SQL statement
