@@ -32,7 +32,7 @@ The main interface is :class:`TrinoQuery`: ::
     >> query =  TrinoQuery(request, sql)
     >> rows = list(query.execute())
 """
-
+import time
 import copy
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -504,6 +504,7 @@ class TrinoQuery(object):
         return self._use_arrow
 
     def to_pandas(self) -> pd.DataFrame:
+        startTime1 = time.time()
         if self.cancelled:
             raise exceptions.TrinoUserError("Query has been cancelled", self.query_id)
 
@@ -515,10 +516,10 @@ class TrinoQuery(object):
         self._warnings = getattr(status, "warnings", [])
         if status.next_uri is None:
             self._finished = True
-        frames = []
+        tables = []
         if status.arrow_stream is not None:
-            df = self.convert_stream_to_dataframe(status.arrow_stream)
-            frames.append(df)
+            table = self.convert_stream_to_dataframe(status.arrow_stream)
+            tables.append(table)
         
         while self._finished == False:
             response = self._request.get(self._request.next_uri+"?resultFormat=ARROW")
@@ -531,17 +532,30 @@ class TrinoQuery(object):
             if status.next_uri is None:
                 self._finished = True
             if status.arrow_stream is not None:
-                df = self.convert_stream_to_dataframe(status.arrow_stream)
-                frames.append(df)
-        return pd.concat(frames)
+                table = self.convert_stream_to_dataframe(status.arrow_stream)
+                tables.append(table)
+                
+        startTime = time.time()
+        combined_table = pa.concat_tables(tables)
+        result = pa.Table.to_pandas(combined_table)
+        endTime = time.time()
+        elapsed = endTime - startTime
+        print ('Time taken to concatenate df',elapsed)
+        elapsed = endTime - startTime1
+        print ('Time taken to_pandas',elapsed)
+        return result
         
 
-    def convert_stream_to_dataframe(self, arrow_strea):
-        streamString = base64.b64decode(arrow_strea)
+    def convert_stream_to_dataframe(self, arrow_stream)->pa.Table:
+        startTime = time.time()
+        streamString = base64.b64decode(arrow_stream)
         streamBytes = bytes(streamString)
         reader = pa.RecordBatchStreamReader(streamBytes)
-        df = reader.read_pandas()
-        return df
+        table = reader.read_all()
+        endTime = time.time()
+        elapsed = endTime - startTime
+        #print ('Time taken to create 1 df',elapsed)
+        return table
 
 
     def execute(self, additional_http_headers=None) -> TrinoResult:
